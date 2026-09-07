@@ -14,17 +14,16 @@ export function Landing({ onStart, onOpenStats, onOpenSettings }: LandingProps) 
   const [hoveredZone, setHoveredZone] = useState<TargetZone | null>(null);
 
   return (
-    <div className="min-h-screen bg-[#07080A] text-white relative overflow-hidden">
+    <div className="min-h-screen bg-[#07080A] text-white relative">
       {/* Background */}
-      <div className="absolute inset-0">
+      <div className="absolute inset-0 pointer-events-none">
         <div className="absolute inset-0 bg-[radial-gradient(90%_80%_at_50%_0%,#1E2028_0%,#121316_30%,#07080A_70%)]" />
         <div className="absolute inset-0 grid-subtle opacity-[0.03]" />
-        {/* Large soft spotlight */}
         <div className="absolute top-[10%] left-1/2 -translate-x-1/2 w-[800px] h-[800px] bg-[radial-gradient(circle_at_center,rgba(232,255,42,0.08)_0%,transparent_60%)] blur-[40px]" />
       </div>
 
       {/* Header */}
-      <header className="relative z-20 flex items-center justify-between px-6 md:px-10 h-[72px] border-b border-white/[0.06]">
+      <header className="relative z-20 flex items-center justify-between px-6 md:px-10 h-[72px] border-b border-white/[0.06] bg-[#07080A]/80 backdrop-blur-xl sticky top-0">
         <div className="flex items-center gap-8">
           <div className="flex items-baseline gap-2">
             <span className="text-[20px] font-bold tracking-[-0.03em]">PUNCH</span>
@@ -52,7 +51,7 @@ export function Landing({ onStart, onOpenStats, onOpenSettings }: LandingProps) 
               <span className="mono text-[10px] tracking-[0.15em] text-white/70">CAMERA • LOCAL PROCESSING • NO UPLOAD</span>
             </div>
 
-            <h1 className="text-[56px] md:text-[84px] lg:text-[92px] font-bold tracking-[-0.05em] leading-[0.88] uppercase">
+            <h1 className="text-[48px] md:text-[84px] lg:text-[92px] font-bold tracking-[-0.05em] leading-[0.88] uppercase">
               REAL-TIME<br />
               <span className="text-white/20">BOXING</span><br />
               INTERACTION
@@ -63,12 +62,11 @@ export function Landing({ onStart, onOpenStats, onOpenSettings }: LandingProps) 
             </p>
 
             <div className="mt-10 flex flex-wrap gap-3">
-              <button onClick={() => onStart('demo')} className="group relative h-[52px] px-8 bg-[#E8FF2A] text-black font-semibold tracking-[-0.01em] overflow-hidden">
+              <button onClick={() => onStart('demo')} className="group relative h-[52px] px-8 bg-[#E8FF2A] text-black font-semibold tracking-[-0.01em] overflow-hidden hover:bg-white transition-colors">
                 <span className="relative z-10 flex items-center gap-3">
                   TRY DEMO
                   <span className="group-hover:translate-x-0.5 transition-transform">→</span>
                 </span>
-                <div className="absolute inset-0 bg-white translate-y-full group-hover:translate-y-0 transition-transform duration-300" />
               </button>
               <button onClick={() => onStart('free')} className="h-[52px] px-8 border border-white/15 hover:border-white/30 hover:bg-white/[0.04] mono text-[13px] tracking-[0.1em] transition-colors">
                 START TRAINING
@@ -89,7 +87,6 @@ export function Landing({ onStart, onOpenStats, onOpenSettings }: LandingProps) 
             </div>
           </motion.div>
 
-          {/* Game modes */}
           <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.4 }} className="mt-16">
             <div className="mono text-[11px] tracking-[0.2em] text-white/30 mb-4">TRAINING MODES</div>
             <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
@@ -111,42 +108,41 @@ export function Landing({ onStart, onOpenStats, onOpenSettings }: LandingProps) 
           </motion.div>
         </div>
 
-        {/* Right - 3D */}
-        <div className="relative lg:border-l border-white/[0.06] min-h-[600px] lg:min-h-0">
-          <div className="absolute inset-0">
-            <ThreeScene onZoneHover={setHoveredZone} interactive={true} graphicsQuality="high" />
+        {/* Right - 3D - fixed dummy preview, scroll doesn't get blocked */}
+        <div className="relative lg:border-l border-white/[0.06] min-h-[620px] lg:min-h-0 lg:sticky lg:top-[72px] lg:h-[calc(100vh-72px)] overflow-hidden">
+          <div className="absolute inset-0 landing-canvas">
+            <ThreeScene onZoneHover={setHoveredZone} interactive={true} graphicsQuality="high" landingMode={true} />
           </div>
 
           {/* Overlay info */}
-          <div className="absolute bottom-0 left-0 right-0 p-6 md:p-8 bg-gradient-to-t from-black/80 to-transparent pointer-events-none">
-            <div className="flex items-end justify-between">
+          <div className="absolute bottom-0 left-0 right-0 p-6 md:p-8 bg-gradient-to-t from-black/90 via-black/40 to-transparent pointer-events-none">
+            <div className="flex items-end justify-between gap-4">
               <div>
                 <div className="mono text-[10px] tracking-[0.2em] text-white/30 mb-2">TARGET INSPECT</div>
                 <div className="flex items-center gap-3">
-                  <div className="w-8 h-8 rounded-full border border-white/20 flex items-center justify-center">
+                  <div className="w-8 h-8 rounded-full border border-white/20 flex items-center justify-center bg-black/40">
                     <div className="w-1.5 h-1.5 bg-[#E8FF2A] rounded-full animate-pulse" />
                   </div>
                   <div>
-                    <div className="text-[14px] font-medium tracking-[-0.01em]">{hoveredZone ? hoveredZone.replace('_',' ').toUpperCase() : 'HOVER ZONES'}</div>
-                    <div className="mono text-[11px] text-white/40">Drag to rotate • Scroll to zoom • Premium graphite dummy</div>
+                    <div className="text-[14px] font-medium tracking-[-0.01em]">{hoveredZone ? hoveredZone.replace('_',' ').toUpperCase() : 'PREMIUM GRAPHITE DUMMY'}</div>
+                    <div className="mono text-[11px] text-white/40">Drag to rotate • Exact reference replica • Human torso</div>
                   </div>
                 </div>
               </div>
-              <div className="hidden md:block text-right">
+              <div className="hidden md:block text-right max-w-[200px]">
                 <div className="mono text-[10px] tracking-[0.15em] text-white/20">ESTIMATED POWER</div>
-                <div className="mono text-[10px] text-white/30 mt-1 max-w-[200px] leading-[1.4]">Camera cannot measure real Newtons. Power is visual estimate from velocity, extension, accuracy.</div>
+                <div className="mono text-[10px] text-white/30 mt-1 leading-[1.4]">Camera cannot measure Newtons. Visual estimate only.</div>
               </div>
             </div>
           </div>
 
-          {/* Floating stats */}
           <div className="absolute top-8 right-8 hidden lg:flex flex-col gap-2 pointer-events-none">
             {[
               { label: 'VELOCITY', value: '8.4 m/s' },
               { label: 'EXTENSION', value: '0.87' },
               { label: 'ACCURACY', value: '91%' },
             ].map(s => (
-              <div key={s.label} className="px-3 py-2 bg-black/60 backdrop-blur-xl border border-white/[0.08] mono text-[10px]">
+              <div key={s.label} className="px-3 py-2 bg-black/70 backdrop-blur-xl border border-white/[0.08] mono text-[10px]">
                 <div className="text-white/30 tracking-[0.1em]">{s.label}</div>
                 <div className="text-white tracking-[0.05em] mt-0.5">{s.value}</div>
               </div>
@@ -155,7 +151,7 @@ export function Landing({ onStart, onOpenStats, onOpenSettings }: LandingProps) 
         </div>
       </div>
 
-      {/* How it works */}
+      {/* How it works - now scrollable */}
       <section className="relative z-10 border-t border-white/[0.06] bg-[#0A0B0D]">
         <div className="max-w-[1600px] mx-auto px-6 md:px-10 lg:px-16 py-16 md:py-24 grid md:grid-cols-4 gap-8">
           {[
@@ -173,12 +169,32 @@ export function Landing({ onStart, onOpenStats, onOpenSettings }: LandingProps) 
         </div>
       </section>
 
-      {/* Safety */}
+      <section className="relative z-10 border-t border-white/[0.06] bg-[#07080A] py-16 md:py-24">
+        <div className="max-w-[1600px] mx-auto px-6 md:px-10 lg:px-16">
+          <div className="flex flex-col md:flex-row justify-between gap-8 mb-12">
+            <h2 className="text-[36px] md:text-[48px] font-bold tracking-[-0.04em] leading-[0.9]">BUILT LIKE<br /><span className="text-white/20">REAL HARDWARE</span></h2>
+            <p className="max-w-[400px] text-[14px] leading-[1.6] text-white/40">Reference-accurate dummy: human torso silhouette, head, shoulders, chest, abdomen, pleated skirt, heavy cylindrical base. Not a blob — exact premium commercial asset.</p>
+          </div>
+          <div className="grid md:grid-cols-3 gap-4">
+            {[
+              { title: 'HUMAN TORSO', desc: 'Chest, abs, shoulders, neck — realistic proportions' },
+              { title: 'PLEATED SKIRT', desc: 'Black fabric covering like real freestanding bag' },
+              { title: 'HEAVY BASE', desc: 'Cylindrical base with handle, grounded physics' },
+            ].map(c => (
+              <div key={c.title} className="p-6 bg-white/[0.02] border border-white/[0.06]">
+                <div className="mono text-[11px] tracking-[0.15em] text-[#E8FF2A] mb-2">{c.title}</div>
+                <div className="text-[13px] text-white/60 leading-[1.5]">{c.desc}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+
       <div className="relative z-10 border-t border-white/[0.06] px-6 md:px-10 lg:px-16 py-6 flex flex-col md:flex-row gap-4 justify-between items-start md:items-center bg-black/20">
         <p className="mono text-[10px] leading-[1.6] tracking-[0.05em] text-white/30 max-w-[720px]">
-          SAFETY: Train within your comfort level. Use appropriate boxing equipment and adequate space. Stop if you feel pain, dizziness, or unusual discomfort. Do not punch harder just to increase a score. This is a training visualization, not a combat instruction.
+          SAFETY: Train within your comfort level. Use appropriate boxing equipment and adequate space. Stop if you feel pain, dizziness, or unusual discomfort. Do not punch harder just to increase a score.
         </p>
-        <div className="mono text-[10px] tracking-[0.15em] text-white/20">PUNCH//AI © 2026 — FUTURE HARDWARE READY</div>
+        <div className="mono text-[10px] tracking-[0.15em] text-white/20">PUNCH//AI © 2026 — SCROLL FIXED • EXACT DUMMY</div>
       </div>
     </div>
   );

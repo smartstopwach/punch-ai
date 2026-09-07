@@ -8,11 +8,12 @@
   -moz-osx-font-smoothing: grayscale;
 }
 
-html, body {
+html {
   background: #07080A;
   color: white;
   overflow-x: hidden;
-  overscroll-behavior: none;
+  overflow-y: auto;
+  scroll-behavior: smooth;
   margin: 0;
   padding: 0;
 }
@@ -20,12 +21,17 @@ html, body {
 body {
   background: radial-gradient(120% 120% at 50% -20%, #1C1E24 0%, #0A0B0D 40%, #07080A 100%);
   min-height: 100vh;
+  overflow-x: hidden;
+  overflow-y: auto;
+  margin: 0;
+  padding: 0;
+  overscroll-behavior-y: auto;
 }
 
 /* Custom scrollbar */
 ::-webkit-scrollbar {
-  width: 4px;
-  height: 4px;
+  width: 6px;
+  height: 6px;
 }
 ::-webkit-scrollbar-track {
   background: #121316;
@@ -60,3 +66,8 @@ button:focus-visible, a:focus-visible {
 /* Hide scrollbar for game */
 .no-scrollbar::-webkit-scrollbar { display: none; }
 .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+/* Ensure canvas doesn't block scroll on landing */
+.landing-canvas {
+  touch-action: pan-y;
+}
