@@ -40,10 +40,37 @@ export class VectorFilter {
   fx: OneEuroFilter;
   fy: OneEuroFilter;
   fz: OneEuroFilter;
+  constructor(lowLatency = true) {
+    // Low latency mode: higher cutoff = less lag, more responsive
+    // High stability mode: lower cutoff = smoother but more lag
+    if (lowLatency) {
+      this.fx = new OneEuroFilter(2.8, 0.06, 1.2);
+      this.fy = new OneEuroFilter(2.8, 0.06, 1.2);
+      this.fz = new OneEuroFilter(2.8, 0.06, 1.2);
+    } else {
+      this.fx = new OneEuroFilter(1.2, 0.02, 1.0);
+      this.fy = new OneEuroFilter(1.2, 0.02, 1.0);
+      this.fz = new OneEuroFilter(1.2, 0.02, 1.0);
+    }
+  }
+  filter(v: {x:number,y:number,z?:number}, t?: number) {
+    return {
+      x: this.fx.filter(v.x, t),
+      y: this.fy.filter(v.y, t),
+      z: v.z !== undefined ? this.fz.filter(v.z, t) : undefined,
+    };
+  }
+}
+
+export class LowLatencyFilter {
+  // Ultra low latency - minimal smoothing, instant response
+  fx: OneEuroFilter;
+  fy: OneEuroFilter;
+  fz: OneEuroFilter;
   constructor() {
-    this.fx = new OneEuroFilter(1.2, 0.02);
-    this.fy = new OneEuroFilter(1.2, 0.02);
-    this.fz = new OneEuroFilter(1.2, 0.02);
+    this.fx = new OneEuroFilter(4.5, 0.12, 1.5);
+    this.fy = new OneEuroFilter(4.5, 0.12, 1.5);
+    this.fz = new OneEuroFilter(4.5, 0.12, 1.5);
   }
   filter(v: {x:number,y:number,z?:number}, t?: number) {
     return {
