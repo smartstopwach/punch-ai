@@ -39,6 +39,7 @@ function App() {
   const [pendingMode, setPendingMode] = useState<GameMode | null>(null);
   const [visionActive, setVisionActive] = useState(false);
   const [debugInfo, setDebugInfo] = useState<{left: boolean, right: boolean, leftVel: number, rightVel: number, leftExt: number, rightExt: number} | null>(null);
+  const [visionResults, setVisionResults] = useState<any>(null);
 
   const [settings, setSettings] = useLocalStorage<Settings>('punchai_settings', {
     soundEnabled: true,
@@ -115,6 +116,7 @@ function App() {
     if (!visionActive || gamePhase !== 'active' || isDemo) return;
 
     const handleResults = (results: any) => {
+      setVisionResults(results);
       // Update debug
       setDebugInfo({
         left: !!results.leftHand,
@@ -338,7 +340,7 @@ function App() {
 
         {view === 'game' && (
           <motion.div key="game" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="relative w-screen h-screen overflow-hidden bg-[#07080A]">
-            <CameraFeed enabled={cameraEnabled} mirror={settings.mirrorCamera} privacyMode={settings.privacyMode} onError={setCameraError} />
+            <CameraFeed enabled={cameraEnabled} mirror={settings.mirrorCamera} privacyMode={settings.privacyMode} onError={setCameraError} results={visionResults} showSkeleton={true} />
 
             <div className="absolute inset-0">
               <ThreeScene
