@@ -14,9 +14,9 @@ interface DetectorState {
 export class PunchDetector {
   private states: Map<Hand, DetectorState> = new Map();
   private filters: Map<Hand, OneEuroFilter> = new Map();
-  private velocityThreshold = 0.35;
-  private extensionThreshold = 0.55;
-  private cooldownMs = 280;
+  private velocityThreshold = 0.18;
+  private extensionThreshold = 0.45;
+  private cooldownMs = 260;
   private lastPunchTime: Map<Hand, number> = new Map();
   private calibration: CalibrationData | null = null;
 

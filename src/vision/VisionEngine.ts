@@ -1,21 +1,24 @@
 import { VisionEngineInterface, HandTracking, TrackingPoint } from '../types';
 import { VectorFilter } from '../utils/smoothing';
 
-/**
- * VisionEngine - Real MediaPipe Tasks Vision implementation
- * Handles:
- * - Hand Landmarker (21 landmarks per hand)
- * - Pose Landmarker (33 landmarks for body)
- * - Air punch calibration
- * 
- * All processing local, no upload
- */
-
 export interface MediaPipeResults {
   leftHand?: HandTracking;
   rightHand?: HandTracking;
   pose?: any;
   timestamp: number;
+  debug?: {
+    leftWrist?: TrackingPoint;
+    rightWrist?: TrackingPoint;
+    leftShoulder?: TrackingPoint;
+    rightShoulder?: TrackingPoint;
+  }
+}
+
+interface HistoryEntry {
+  x: number;
+  y: number;
+  z: number;
+  t: number;
 }
 
 export class VisionEngine implements VisionEngineInterface {
@@ -30,54 +33,75 @@ export class VisionEngine implements VisionEngineInterface {
   private lastResults: MediaPipeResults | null = null;
   private rafId: number | null = null;
   private onResultsCallback?: (results: MediaPipeResults) => void;
-
-  // Calibration
   private calibrationData: any = null;
+
+  // Velocity tracking
+  private leftHistory: HistoryEntry[] = [];
+  private rightHistory: HistoryEntry[] = [];
+  private leftPrevVel = { x: 0, y: 0, z: 0 };
+  private rightPrevVel = { x: 0, y: 0, z: 0 };
 
   async initialize(): Promise<void> {
     if (this.isInitialized) return;
-    
-    console.log('[VisionEngine] Loading MediaPipe Tasks Vision...');
+    console.log('[VisionEngine] Loading MediaPipe...');
     
     try {
-      // Dynamic import to avoid SSR issues
       const { HandLandmarker, PoseLandmarker, FilesetResolver } = await import('@mediapipe/tasks-vision');
       
       const vision = await FilesetResolver.forVisionTasks(
         'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
       );
 
-      // Hand Landmarker - for precise hand tracking
-      this.handLandmarker = await HandLandmarker.createFromOptions(vision, {
-        baseOptions: {
-          modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
-          delegate: 'GPU'
-        },
-        runningMode: 'VIDEO',
-        numHands: 2,
-        minHandDetectionConfidence: 0.5,
-        minHandPresenceConfidence: 0.5,
-        minTrackingConfidence: 0.5
-      });
+      // Try GPU first, fallback to CPU
+      let delegate: 'GPU' | 'CPU' = 'GPU';
+      try {
+        this.handLandmarker = await HandLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+            delegate
+          },
+          runningMode: 'VIDEO',
+          numHands: 2,
+          minHandDetectionConfidence: 0.4,
+          minHandPresenceConfidence: 0.4,
+          minTrackingConfidence: 0.4
+        });
+      } catch (gpuErr) {
+        console.warn('[VisionEngine] GPU failed, trying CPU', gpuErr);
+        delegate = 'CPU';
+        this.handLandmarker = await HandLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+            delegate
+          },
+          runningMode: 'VIDEO',
+          numHands: 2,
+          minHandDetectionConfidence: 0.4,
+          minHandPresenceConfidence: 0.4,
+          minTrackingConfidence: 0.4
+        });
+      }
 
-      // Pose Landmarker - for body, shoulders, calibration
-      this.poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
-        baseOptions: {
-          modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
-          delegate: 'GPU'
-        },
-        runningMode: 'VIDEO',
-        numPoses: 1,
-        minPoseDetectionConfidence: 0.5,
-        minPosePresenceConfidence: 0.5,
-        minTrackingConfidence: 0.5
-      });
+      try {
+        this.poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
+            delegate
+          },
+          runningMode: 'VIDEO',
+          numPoses: 1,
+          minPoseDetectionConfidence: 0.4,
+          minPosePresenceConfidence: 0.4,
+          minTrackingConfidence: 0.4
+        });
+      } catch (e) {
+        console.warn('[VisionEngine] Pose landmarker failed', e);
+      }
 
       this.isInitialized = true;
-      console.log('[VisionEngine] Ready - Hand + Pose landmarkers loaded');
+      console.log('[VisionEngine] Ready - delegate:', delegate);
     } catch (e) {
-      console.warn('[VisionEngine] Failed to load MediaPipe, falling back to mock', e);
-      // Fallback to mock mode - still mark as initialized for demo
+      console.warn('[VisionEngine] MediaPipe load failed, mock mode', e);
       this.isInitialized = true;
       throw e;
     }
@@ -86,38 +110,33 @@ export class VisionEngine implements VisionEngineInterface {
   async startCamera(): Promise<MediaStream> {
     if (!this.isInitialized) await this.initialize();
     
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { 
-          width: { ideal: 1280 }, 
-          height: { ideal: 720 },
-          frameRate: { ideal: 30 },
-          facingMode: 'user' 
-        },
-        audio: false
-      });
-      
-      this.stream = stream;
-      
-      // Create video element for processing
-      if (!this.videoElement) {
-        this.videoElement = document.createElement('video');
-        this.videoElement.autoplay = true;
-        this.videoElement.playsInline = true;
-        this.videoElement.muted = true;
-      }
-      
-      this.videoElement.srcObject = stream;
-      await this.videoElement.play();
-      
-      // Start detection loop
-      this.startDetectionLoop();
-      
-      return stream;
-    } catch (e) {
-      console.error('[VisionEngine] Camera failed', e);
-      throw e;
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { 
+        width: { ideal: 1280 }, 
+        height: { ideal: 720 },
+        frameRate: { ideal: 30 },
+        facingMode: 'user' 
+      },
+      audio: false
+    });
+    
+    this.stream = stream;
+    
+    if (!this.videoElement) {
+      this.videoElement = document.createElement('video');
+      this.videoElement.autoplay = true;
+      this.videoElement.playsInline = true;
+      this.videoElement.muted = true;
     }
+    
+    this.videoElement.srcObject = stream;
+    await this.videoElement.play();
+    
+    this.leftHistory = [];
+    this.rightHistory = [];
+    this.startDetectionLoop();
+    
+    return stream;
   }
 
   private startDetectionLoop() {
@@ -125,7 +144,7 @@ export class VisionEngine implements VisionEngineInterface {
     this.isDetecting = true;
 
     const detect = () => {
-      if (!this.isDetecting || !this.videoElement || !this.handLandmarker) {
+      if (!this.isDetecting || !this.videoElement) {
         this.rafId = requestAnimationFrame(detect);
         return;
       }
@@ -138,11 +157,13 @@ export class VisionEngine implements VisionEngineInterface {
       const now = performance.now();
 
       try {
-        // Hand detection
-        const handResults = this.handLandmarker.detectForVideo(this.videoElement, now);
-        
-        // Pose detection for calibration
+        let handResults = null;
         let poseResults = null;
+
+        if (this.handLandmarker) {
+          handResults = this.handLandmarker.detectForVideo(this.videoElement, now);
+        }
+        
         if (this.poseLandmarker) {
           poseResults = this.poseLandmarker.detectForVideo(this.videoElement, now);
         }
@@ -151,7 +172,7 @@ export class VisionEngine implements VisionEngineInterface {
         this.lastResults = processed;
         this.onResultsCallback?.(processed);
       } catch (e) {
-        // Silent fail, continue loop
+        // continue
       }
 
       this.rafId = requestAnimationFrame(detect);
@@ -160,54 +181,125 @@ export class VisionEngine implements VisionEngineInterface {
     detect();
   }
 
-  private processResults(handResults: any, poseResults: any, timestamp: number): MediaPipeResults {
-    const result: MediaPipeResults = { timestamp };
+  private calculateVelocity(history: HistoryEntry[], current: {x:number,y:number,z:number}, now: number) {
+    // Keep last 5 entries within 200ms
+    const recent = history.filter(h => now - h.t < 250);
+    if (recent.length < 2) {
+      return { x: 0, y: 0, z: 0 };
+    }
+    const oldest = recent[0];
+    const newest = recent[recent.length - 1];
+    const dt = (newest.t - oldest.t) / 1000; // seconds
+    if (dt < 0.01) return { x: 0, y: 0, z: 0 };
+    
+    return {
+      x: (newest.x - oldest.x) / dt,
+      y: (newest.y - oldest.y) / dt,
+      z: (newest.z - oldest.z) / dt,
+    };
+  }
 
-    // Process pose for shoulder positions (for calibration)
+  private processResults(handResults: any, poseResults: any, timestamp: number): MediaPipeResults {
+    const result: MediaPipeResults = { timestamp, debug: {} };
+
     let leftShoulder: TrackingPoint | undefined;
     let rightShoulder: TrackingPoint | undefined;
+    let leftElbow: TrackingPoint | undefined;
+    let rightElbow: TrackingPoint | undefined;
+    let poseLeftWrist: TrackingPoint | undefined;
+    let poseRightWrist: TrackingPoint | undefined;
     
     if (poseResults?.landmarks?.[0]) {
       const pose = poseResults.landmarks[0];
-      // Pose landmarks: 11=left shoulder, 12=right shoulder, 13=left elbow, 14=right elbow, 15=left wrist, 16=right wrist
-      if (pose[11]) leftShoulder = { x: pose[11].x, y: pose[11].y, z: pose[11].z ?? 0, visibility: pose[11].visibility };
-      if (pose[12]) rightShoulder = { x: pose[12].x, y: pose[12].y, z: pose[12].z ?? 0, visibility: pose[12].visibility };
+      // 11:left shoulder, 12:right shoulder, 13:left elbow, 14:right elbow, 15:left wrist, 16:right wrist
+      if (pose[11]?.visibility > 0.3) leftShoulder = { x: pose[11].x, y: pose[11].y, z: pose[11].z ?? 0, visibility: pose[11].visibility };
+      if (pose[12]?.visibility > 0.3) rightShoulder = { x: pose[12].x, y: pose[12].y, z: pose[12].z ?? 0, visibility: pose[12].visibility };
+      if (pose[13]?.visibility > 0.3) leftElbow = { x: pose[13].x, y: pose[13].y, z: pose[13].z ?? 0, visibility: pose[13].visibility };
+      if (pose[14]?.visibility > 0.3) rightElbow = { x: pose[14].x, y: pose[14].y, z: pose[14].z ?? 0, visibility: pose[14].visibility };
+      if (pose[15]?.visibility > 0.3) poseLeftWrist = { x: pose[15].x, y: pose[15].y, z: pose[15].z ?? 0, visibility: pose[15].visibility };
+      if (pose[16]?.visibility > 0.3) poseRightWrist = { x: pose[16].x, y: pose[16].y, z: pose[16].z ?? 0, visibility: pose[16].visibility };
+
+      result.debug!.leftShoulder = leftShoulder;
+      result.debug!.rightShoulder = rightShoulder;
+      result.debug!.leftWrist = poseLeftWrist;
+      result.debug!.rightWrist = poseRightWrist;
     }
 
-    // Process hands
+    // Process hands from HandLandmarker
+    const detectedHands = new Map<string, any>();
+
     if (handResults?.landmarks) {
       for (let i = 0; i < handResults.landmarks.length; i++) {
         const landmarks = handResults.landmarks[i];
-        const handedness = handResults.handednesses?.[i]?.[0]?.categoryName?.toLowerCase() || (i === 0 ? 'left' : 'right');
+        const handedness = handResults.handednesses?.[i]?.[0]?.categoryName?.toLowerCase() || '';
         const isLeft = handedness.includes('left');
-        
-        // Wrist is landmark 0, index tip 8, etc.
+        const key = isLeft ? 'left' : 'right';
         const wrist = landmarks[0];
         if (!wrist) continue;
-
-        const tracking: HandTracking = {
-          hand: isLeft ? 'left' : 'right',
-          wrist: { x: wrist.x, y: wrist.y, z: wrist.z ?? 0 },
-          elbow: isLeft ? leftShoulder : rightShoulder, // approximate, better from pose
-          shoulder: isLeft ? leftShoulder : rightShoulder,
-          landmarks: landmarks.map((l: any) => ({ x: l.x, y: l.y, z: l.z ?? 0, visibility: 1 })),
-          velocity: { x: 0, y: 0, z: 0 }, // calculated via filter diff
-          acceleration: { x: 0, y: 0, z: 0 },
-          extension: this.calculateExtension(wrist, isLeft ? leftShoulder : rightShoulder),
-          state: 'READY',
-          confidence: handResults.handednesses?.[i]?.[0]?.score ?? 0.8,
-        };
-
-        // Apply smoothing
-        const filtered = isLeft ? this.leftFilter.filter(tracking.wrist, timestamp/1000) : this.rightFilter.filter(tracking.wrist, timestamp/1000);
-        tracking.wrist = { ...tracking.wrist, ...filtered };
-
-        if (isLeft) result.leftHand = tracking;
-        else result.rightHand = tracking;
+        detectedHands.set(key, { landmarks, wrist, confidence: handResults.handednesses?.[i]?.[0]?.score ?? 0.8, source: 'hand' });
       }
     }
 
-    // Attach pose
+    // Fallback to pose wrists if hand not detected (crucial for air punches)
+    if (!detectedHands.has('left') && poseLeftWrist) {
+      detectedHands.set('left', { 
+        landmarks: [], 
+        wrist: poseLeftWrist, 
+        confidence: poseLeftWrist.visibility ?? 0.6,
+        source: 'pose'
+      });
+    }
+    if (!detectedHands.has('right') && poseRightWrist) {
+      detectedHands.set('right', { 
+        landmarks: [], 
+        wrist: poseRightWrist, 
+        confidence: poseRightWrist.visibility ?? 0.6,
+        source: 'pose'
+      });
+    }
+
+    // Build tracking objects with velocity
+    for (const [handKey, data] of detectedHands) {
+      const isLeft = handKey === 'left';
+      const wrist = data.wrist;
+      
+      // Update history
+      const history = isLeft ? this.leftHistory : this.rightHistory;
+      history.push({ x: wrist.x, y: wrist.y, z: wrist.z ?? 0, t: timestamp });
+      if (history.length > 10) history.shift();
+
+      const velocity = this.calculateVelocity(history, wrist, timestamp);
+      const prevVel = isLeft ? this.leftPrevVel : this.rightPrevVel;
+      const dt = 0.033; // approx 30fps
+      const acceleration = {
+        x: (velocity.x - prevVel.x) / dt,
+        y: (velocity.y - prevVel.y) / dt,
+        z: (velocity.z - prevVel.z) / dt,
+      };
+
+      if (isLeft) this.leftPrevVel = velocity;
+      else this.rightPrevVel = velocity;
+
+      // Smoothing
+      const filtered = isLeft ? this.leftFilter.filter(wrist, timestamp/1000) : this.rightFilter.filter(wrist, timestamp/1000);
+
+      const tracking: HandTracking = {
+        hand: handKey as any,
+        wrist: { x: filtered.x, y: filtered.y, z: (filtered as any).z ?? wrist.z ?? 0 },
+        elbow: isLeft ? leftElbow : rightElbow,
+        shoulder: isLeft ? leftShoulder : rightShoulder,
+        landmarks: data.landmarks?.map((l: any) => ({ x: l.x, y: l.y, z: l.z ?? 0, visibility: 1 })) || [],
+        velocity,
+        acceleration,
+        extension: this.calculateExtension(wrist, isLeft ? leftShoulder : rightShoulder),
+        state: 'READY',
+        confidence: data.confidence,
+      };
+
+      if (isLeft) result.leftHand = tracking;
+      else result.rightHand = tracking;
+    }
+
     if (poseResults) result.pose = poseResults;
 
     return result;
@@ -219,11 +311,10 @@ export class VisionEngine implements VisionEngineInterface {
     const dy = wrist.y - shoulder.y;
     const dz = (wrist.z ?? 0) - (shoulder.z ?? 0);
     const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
-    // Normalize: typical arm length ~0.6 normalized units
-    return Math.min(1, dist / 0.6);
+    // Typical arm length 0.5-0.7 normalized
+    return Math.min(1.2, dist / 0.55);
   }
 
-  // For external consumption
   getTrackingData(): { leftHand?: HandTracking; rightHand?: HandTracking } {
     return {
       leftHand: this.lastResults?.leftHand,
@@ -252,6 +343,8 @@ export class VisionEngine implements VisionEngineInterface {
     if (this.videoElement) {
       this.videoElement.srcObject = null;
     }
+    this.leftHistory = [];
+    this.rightHistory = [];
   }
 
   setCalibration(data: any) {
@@ -269,7 +362,6 @@ export class VisionEngine implements VisionEngineInterface {
     this.isInitialized = false;
   }
 
-  // Compatibility
   detectHands(): HandTracking[] { return []; }
   detectPose(): any { return null; }
   detectPunch(): any { return null; }

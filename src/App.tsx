@@ -38,6 +38,7 @@ function App() {
   const [calibration, setCalibration] = useState<CalibrationData | null>(null);
   const [pendingMode, setPendingMode] = useState<GameMode | null>(null);
   const [visionActive, setVisionActive] = useState(false);
+  const [debugInfo, setDebugInfo] = useState<{left: boolean, right: boolean, leftVel: number, rightVel: number, leftExt: number, rightExt: number} | null>(null);
 
   const [settings, setSettings] = useLocalStorage<Settings>('punchai_settings', {
     soundEnabled: true,
@@ -114,19 +115,28 @@ function App() {
     if (!visionActive || gamePhase !== 'active' || isDemo) return;
 
     const handleResults = (results: any) => {
+      // Update debug
+      setDebugInfo({
+        left: !!results.leftHand,
+        right: !!results.rightHand,
+        leftVel: results.leftHand ? Math.hypot(results.leftHand.velocity.x, results.leftHand.velocity.y, results.leftHand.velocity.z) : 0,
+        rightVel: results.rightHand ? Math.hypot(results.rightHand.velocity.x, results.rightHand.velocity.y, results.rightHand.velocity.z) : 0,
+        leftExt: results.leftHand?.extension || 0,
+        rightExt: results.rightHand?.extension || 0,
+      });
+
       // Try both hands
       const hands = [results.leftHand, results.rightHand].filter(Boolean);
       for (const hand of hands) {
         if (!hand) continue;
         const punch = punchDetector.update(hand);
         if (punch) {
-          // Map to target zone based on hand position
           const normalizedPoint = { x: hand.wrist.x, y: hand.wrist.y };
           const mapped = targetMapper.map(normalizedPoint);
           const finalPunch: PunchEvent = {
             ...punch,
             targetZone: mapped.zone,
-            accuracy: mapped.accuracy,
+            accuracy: Math.min(100, mapped.accuracy + (calibration ? 10 : 0)),
             estimatedPower: Math.min(99, Math.max(10, Math.round(
               (punch.velocity / 12) * 45 +
               punch.extension * 30 +
@@ -141,10 +151,25 @@ function App() {
 
     visionEngine.onResults(handleResults);
 
+    // Poll debug every 100ms
+    const interval = setInterval(() => {
+      const latest = visionEngine.getLatestResults();
+      if (latest) {
+        setDebugInfo({
+          left: !!latest.leftHand,
+          right: !!latest.rightHand,
+          leftVel: latest.leftHand ? Math.hypot(latest.leftHand.velocity.x, latest.leftHand.velocity.y) : 0,
+          rightVel: latest.rightHand ? Math.hypot(latest.rightHand.velocity.x, latest.rightHand.velocity.y) : 0,
+          leftExt: latest.leftHand?.extension || 0,
+          rightExt: latest.rightHand?.extension || 0,
+        });
+      }
+    }, 100);
+
     return () => {
-      // cleanup handled by visionEngine
+      clearInterval(interval);
     };
-  }, [visionActive, gamePhase, isDemo]);
+  }, [visionActive, gamePhase, isDemo, calibration]);
 
   // Countdown logic
   useEffect(() => {
@@ -264,7 +289,7 @@ function App() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (view !== 'game' || gamePhase !== 'active') return;
-      if (e.code === 'Space' || e.code === 'Enter') {
+      if (e.code === 'Space' || e.code === 'Enter' || e.code === 'KeyA' || e.code === 'KeyD' || e.code === 'ArrowLeft' || e.code === 'ArrowRight') {
         e.preventDefault();
         handlePunchManual();
       }
@@ -328,7 +353,38 @@ function App() {
 
             <HUD gameState={gameState} latestPunch={latestPunch} isDemo={isDemo} />
 
-            <button onClick={handlePunchManual} className="absolute inset-0 z-10 cursor-crosshair opacity-0" aria-label="Punch" />
+            {/* Debug overlay for camera */}
+            {cameraEnabled && !isDemo && (
+              <div className="absolute top-[88px] left-6 z-20 px-3 py-2 bg-black/70 border border-white/10 backdrop-blur-xl mono text-[10px] leading-[1.4]">
+                <div className="text-white/30 tracking-[0.1em] mb-1">VISION DEBUG • AIR PUNCH</div>
+                <div className="flex gap-4">
+                  <div className={`${debugInfo?.left ? 'text-[#22C55E]' : 'text-white/20'}`}>L: {debugInfo?.left ? 'DETECTED' : 'NO'} {debugInfo ? `v:${debugInfo.leftVel.toFixed(2)} e:${debugInfo.leftExt.toFixed(2)}` : ''}</div>
+                  <div className={`${debugInfo?.right ? 'text-[#E8FF2A]' : 'text-white/20'}`}>R: {debugInfo?.right ? 'DETECTED' : 'NO'} {debugInfo ? `v:${debugInfo.rightVel.toFixed(2)} e:${debugInfo.rightExt.toFixed(2)}` : ''}</div>
+                </div>
+                <div className="mt-1 text-white/30 text-[9px]">Punch = velocity &gt; {punchDetector.getCalibration()?.velocityThreshold.toFixed(2) || '0.18'} + extension &gt; {punchDetector.getCalibration()?.extensionThreshold.toFixed(2) || '0.45'}</div>
+                {(!debugInfo?.left && !debugInfo?.right) && <div className="mt-1 text-[#FF4D4D]">HANDS NOT DETECTED • Move closer, good lighting, show palms</div>}
+              </div>
+            )}
+
+            {/* Manual punch - always works even in camera mode */}
+            <div className="absolute inset-0 z-10">
+              <button onClick={handlePunchManual} className="absolute inset-0 cursor-crosshair opacity-0" aria-label="Punch" />
+              <div className="absolute bottom-[140px] left-1/2 -translate-x-1/2 pointer-events-none">
+                <div className="px-4 py-2 bg-black/60 border border-white/10 backdrop-blur-xl mono text-[10px] tracking-[0.1em] text-white/40 text-center">
+                  {cameraEnabled && !isDemo ? 'AIR PUNCH IN HAWA ME • OR CLICK / SPACE' : 'CLICK ANYWHERE OR PRESS SPACE TO PUNCH'}
+                </div>
+              </div>
+            </div>
+
+            {/* Visible punch buttons for desktop too */}
+            <div className="absolute bottom-[100px] left-1/2 -translate-x-1/2 z-20 hidden md:flex gap-3">
+              <button onClick={handlePunchManual} className="px-6 h-12 bg-white/10 border border-white/20 backdrop-blur-xl hover:bg-white hover:text-black mono text-[11px] tracking-[0.1em] transition-colors">
+                LEFT PUNCH (A)
+              </button>
+              <button onClick={handlePunchManual} className="px-6 h-12 bg-[#E8FF2A]/20 border border-[#E8FF2A]/30 backdrop-blur-xl hover:bg-[#E8FF2A] hover:text-black mono text-[11px] tracking-[0.1em] transition-colors">
+                RIGHT PUNCH (D) • 100% ACC
+              </button>
+            </div>
 
             <AnimatePresence>
               {gamePhase === 'countdown' && (
