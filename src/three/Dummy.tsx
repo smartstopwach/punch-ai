@@ -66,16 +66,16 @@ export function Dummy({ onHitZoneHover, activeZone, impact, scale = 1 }: DummyPr
 
   useFrame((state, delta) => {
     if (!groupRef.current) return;
-    breath.current += delta * 0.8;
-    const b = Math.sin(breath.current) * 0.006;
+    breath.current += delta * 0.6;
+    const b = Math.sin(breath.current) * 0.004;
 
     if (torsoGroupRef.current) {
-      torsoGroupRef.current.scale.set(1 + b, 1 + b * 0.35, 1 + b);
+      torsoGroupRef.current.scale.set(1 + b, 1 + b * 0.25, 1 + b);
     }
 
     const s = sway.current;
-    const stiffness = 3.0;
-    const damping = 0.90;
+    const stiffness = 2.8;
+    const damping = 0.94;
 
     s.vx += -s.x * stiffness * delta;
     s.vy += -s.y * stiffness * delta;
@@ -83,14 +83,18 @@ export function Dummy({ onHitZoneHover, activeZone, impact, scale = 1 }: DummyPr
     s.vx *= damping;
     s.vy *= damping;
     s.vz *= damping;
-    s.x += s.vx * delta * 10;
-    s.y += s.vy * delta * 10;
-    s.z += s.vz * delta * 10;
+    s.x += s.vx * delta * 9;
+    s.y += s.vy * delta * 9;
+    s.z += s.vz * delta * 9;
 
-    groupRef.current.rotation.x = s.z * 0.32;
-    groupRef.current.rotation.z = -s.x * 0.28;
-    groupRef.current.rotation.y = s.x * 0.15 + Math.sin(state.clock.elapsedTime * 0.15) * 0.015;
-    groupRef.current.position.y = s.y - 0.30;
+    // Clamp to prevent wild swings - stability
+    s.x = Math.max(-0.35, Math.min(0.35, s.x));
+    s.z = Math.max(-0.45, Math.min(0.15, s.z));
+
+    groupRef.current.rotation.x = s.z * 0.28;
+    groupRef.current.rotation.z = -s.x * 0.22;
+    groupRef.current.rotation.y = s.x * 0.12 + Math.sin(state.clock.elapsedTime * 0.12) * 0.01;
+    groupRef.current.position.y = s.y * 0.5 - 0.30;
   });
 
   return (

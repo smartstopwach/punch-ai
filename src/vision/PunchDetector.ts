@@ -1,6 +1,7 @@
 import { HandTracking, PunchEvent, PunchState, PunchType, Hand } from '../types';
 import { OneEuroFilter } from '../utils/smoothing';
 import { CalibrationData } from './CalibrationEngine';
+import { PunchStabilityGate, MovingAverage } from '../utils/stability';
 
 interface DetectorState {
   state: PunchState;
@@ -9,6 +10,9 @@ interface DetectorState {
   maxVelocity: number;
   extension: number;
   trajectory: { x: number; y: number; z: number }[];
+  stabilityGate: PunchStabilityGate;
+  velAvg: MovingAverage;
+  extAvg: MovingAverage;
 }
 
 export class PunchDetector {
@@ -16,14 +20,14 @@ export class PunchDetector {
   private filters: Map<Hand, OneEuroFilter> = new Map();
   private velocityThreshold = 0.18;
   private extensionThreshold = 0.45;
-  private cooldownMs = 260;
+  private cooldownMs = 320;
   private lastPunchTime: Map<Hand, number> = new Map();
   private calibration: CalibrationData | null = null;
 
   constructor() {
     (['left','right'] as Hand[]).forEach(h => {
       this.states.set(h, this.createIdleState());
-      this.filters.set(h, new OneEuroFilter(1.5, 0.02));
+      this.filters.set(h, new OneEuroFilter(1.2, 0.015));
       this.lastPunchTime.set(h, 0);
     });
   }
@@ -35,17 +39,19 @@ export class PunchDetector {
       startPos: { x: 0, y: 0, z: 0 },
       maxVelocity: 0,
       extension: 0,
-      trajectory: []
+      trajectory: [],
+      stabilityGate: new PunchStabilityGate(),
+      velAvg: new MovingAverage(4),
+      extAvg: new MovingAverage(5),
     };
   }
 
   setCalibration(data: CalibrationData | null) {
     this.calibration = data;
     if (data) {
-      // Personalized thresholds for 100% air punch accuracy
-      this.velocityThreshold = data.velocityThreshold;
-      this.extensionThreshold = data.extensionThreshold;
-      console.log('[PunchDetector] Calibrated thresholds:', {
+      this.velocityThreshold = Math.max(0.15, data.velocityThreshold);
+      this.extensionThreshold = Math.max(0.42, data.extensionThreshold);
+      console.log('[PunchDetector] Stable calibrated:', {
         velocity: this.velocityThreshold,
         extension: this.extensionThreshold,
         accuracy: data.accuracy
@@ -58,10 +64,9 @@ export class PunchDetector {
   }
 
   /**
-   * State machine for air punch detection:
-   * IDLE -> READY -> MOVING -> EXTENDING -> IMPACT -> RECOVERY -> READY
-   * 
-   * With calibration, achieves 100% accuracy for air punches in hawa me
+   * Ultra stable state machine:
+   * Requires 3 consistent frames above threshold before triggering
+   * Prevents jitter and false positives
    */
   update(tracking: HandTracking): PunchEvent | null {
     const hand = tracking.hand;
@@ -73,15 +78,22 @@ export class PunchDetector {
       return null;
     }
 
-    const speed = Math.hypot(tracking.velocity.x, tracking.velocity.y, tracking.velocity.z ?? 0);
-    const filteredSpeed = this.filters.get(hand)!.filter(speed, now/1000);
-
-    // Use calibrated max extension to normalize
-    let normalizedExtension = tracking.extension;
-    if (this.calibration) {
-      const maxExt = hand === 'left' ? this.calibration.leftMaxExtension : this.calibration.rightMaxExtension;
-      normalizedExtension = Math.min(1, tracking.extension / (maxExt * 0.95));
+    // Confidence gate - ignore low confidence
+    if (tracking.confidence < 0.38) {
+      if (state.state !== 'IDLE') state.state = 'READY';
+      return null;
     }
+
+    const rawSpeed = Math.hypot(tracking.velocity.x, tracking.velocity.y, tracking.velocity.z ?? 0);
+    const filteredSpeed = this.filters.get(hand)!.filter(rawSpeed, now/1000);
+    const smoothedSpeed = state.velAvg.add(filteredSpeed);
+    const smoothedExt = state.extAvg.add(tracking.extension);
+
+    // Stability gate check
+    const gate = state.stabilityGate.check(smoothedExt, smoothedSpeed, {
+      extension: this.extensionThreshold,
+      velocity: this.velocityThreshold
+    });
 
     switch (state.state) {
       case 'IDLE':
@@ -89,53 +101,69 @@ export class PunchDetector {
           state.state = 'READY';
           state.startPos = { ...tracking.wrist, z: tracking.wrist.z ?? 0 };
           state.trajectory = [];
+          state.stabilityGate.clear();
         }
         break;
 
       case 'READY':
-        if (filteredSpeed > this.velocityThreshold * 0.6 && normalizedExtension > 0.35) {
+        // Need consistent frames above threshold
+        if (gate.shouldStart && gate.confidence > 0.55) {
           state.state = 'MOVING';
           state.startTime = now;
-          state.maxVelocity = filteredSpeed;
+          state.maxVelocity = smoothedSpeed;
           state.trajectory = [{ x: tracking.wrist.x, y: tracking.wrist.y, z: tracking.wrist.z ?? 0 }];
         }
         break;
 
       case 'MOVING':
-        state.maxVelocity = Math.max(state.maxVelocity, filteredSpeed);
+        state.maxVelocity = Math.max(state.maxVelocity, smoothedSpeed);
         state.trajectory.push({ x: tracking.wrist.x, y: tracking.wrist.y, z: tracking.wrist.z ?? 0 });
-        if (normalizedExtension > this.extensionThreshold && filteredSpeed > this.velocityThreshold) {
+        
+        if (gate.shouldExtend && gate.confidence > 0.6) {
           state.state = 'EXTENDING';
-        } else if (filteredSpeed < this.velocityThreshold * 0.3) {
+        } else if (smoothedSpeed < this.velocityThreshold * 0.25 && smoothedExt < this.extensionThreshold * 0.8) {
+          // Return to ready only if clearly stopped and retracted
           state.state = 'READY';
+          state.stabilityGate.clear();
         }
-        if (now - state.startTime > 900) state.state = 'READY';
+        if (now - state.startTime > 1000) {
+          state.state = 'READY';
+          state.stabilityGate.clear();
+        }
         break;
 
       case 'EXTENDING':
-        state.maxVelocity = Math.max(state.maxVelocity, filteredSpeed);
+        state.maxVelocity = Math.max(state.maxVelocity, smoothedSpeed);
         state.trajectory.push({ x: tracking.wrist.x, y: tracking.wrist.y, z: tracking.wrist.z ?? 0 });
-        // Air punch impact: velocity drop after peak OR max extension reached
-        const isMaxExtension = normalizedExtension > 0.88;
-        const isVelocityDrop = filteredSpeed < state.maxVelocity * 0.48;
-        const isQuickRetract = state.trajectory.length > 3 && filteredSpeed < this.velocityThreshold * 0.6;
         
-        if (isMaxExtension || isVelocityDrop || isQuickRetract) {
+        // Stable impact detection: need velocity drop OR max extension, with confidence
+        if (gate.shouldImpact && gate.confidence > 0.65) {
           state.state = 'IMPACT';
-          const punch = this.createPunchEvent(tracking, state, normalizedExtension);
+          const punch = this.createPunchEvent(tracking, state, smoothedExt, smoothedSpeed);
           this.lastPunchTime.set(hand, now);
           state.state = 'RECOVERY';
           setTimeout(() => {
             const s = this.states.get(hand);
-            if (s) s.state = 'READY';
-          }, 160);
+            if (s) {
+              s.state = 'READY';
+              s.stabilityGate.clear();
+            }
+          }, 180);
           return punch;
         }
-        if (now - state.startTime > 650) state.state = 'READY';
+        if (now - state.startTime > 700) {
+          state.state = 'READY';
+          state.stabilityGate.clear();
+        }
         break;
 
       case 'RECOVERY':
-        if (filteredSpeed < this.velocityThreshold * 0.5) {
+        // Wait for stable rest position
+        if (smoothedSpeed < this.velocityThreshold * 0.35 && smoothedExt < this.extensionThreshold) {
+          state.state = 'READY';
+          state.stabilityGate.clear();
+        }
+        if (now - state.startTime > 500) {
           state.state = 'READY';
         }
         break;
@@ -144,19 +172,16 @@ export class PunchDetector {
     return null;
   }
 
-  private createPunchEvent(tracking: HandTracking, state: DetectorState, normalizedExt: number): PunchEvent {
+  private createPunchEvent(tracking: HandTracking, state: DetectorState, smoothedExt: number, smoothedSpeed: number): PunchEvent {
     const type = this.classifyPunch(tracking);
-    // Boost accuracy if calibrated
-    const accuracyBoost = this.calibration ? Math.min(15, this.calibration.accuracy * 0.15) : 0;
-    
     return {
-      id: `${tracking.hand}-${Date.now()}`,
+      id: `${tracking.hand}-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
       hand: tracking.hand,
       type,
       timestamp: Date.now(),
       velocity: parseFloat((state.maxVelocity * 12).toFixed(1)),
-      acceleration: parseFloat((state.maxVelocity * 15).toFixed(1)),
-      extension: parseFloat(normalizedExt.toFixed(2)),
+      acceleration: parseFloat((state.maxVelocity * 14).toFixed(1)),
+      extension: parseFloat(smoothedExt.toFixed(2)),
       trajectory: [...state.trajectory],
       targetZone: 'center_chest',
       accuracy: 0,
@@ -169,19 +194,23 @@ export class PunchDetector {
     const vy = tracking.velocity.y;
     const isRight = tracking.hand === 'right';
 
-    if (Math.abs(vy) > Math.abs(vx) * 1.2 && vy < -0.2) {
+    if (Math.abs(vy) > Math.abs(vx) * 1.3 && vy < -0.25) {
       return isRight ? 'right_uppercut' : 'left_uppercut';
     }
-    if (Math.abs(vx) > Math.abs(vy) * 0.8) {
-      if (Math.abs(vx) > 0.4) {
-        return isRight ? 'right_hook' : 'left_hook';
-      }
+    if (Math.abs(vx) > Math.abs(vy) * 0.85 && Math.abs(vx) > 0.45) {
+      return isRight ? 'right_hook' : 'left_hook';
     }
     return isRight ? 'cross' : 'jab';
   }
 
   reset() {
     (['left','right'] as Hand[]).forEach(h => {
+      const s = this.states.get(h);
+      if (s) {
+        s.stabilityGate.clear();
+        s.velAvg.clear();
+        s.extAvg.clear();
+      }
       this.states.set(h, this.createIdleState());
       this.lastPunchTime.set(h, 0);
     });

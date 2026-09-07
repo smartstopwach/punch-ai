@@ -1,5 +1,6 @@
 import { VisionEngineInterface, HandTracking, TrackingPoint } from '../types';
 import { VectorFilter } from '../utils/smoothing';
+import { StabilityFilter } from '../utils/stability';
 
 export interface MediaPipeResults {
   leftHand?: HandTracking;
@@ -30,12 +31,13 @@ export class VisionEngine implements VisionEngineInterface {
   private isDetecting = false;
   private leftFilter = new VectorFilter();
   private rightFilter = new VectorFilter();
+  private leftStability = new StabilityFilter();
+  private rightStability = new StabilityFilter();
   private lastResults: MediaPipeResults | null = null;
   private rafId: number | null = null;
   private onResultsCallback?: (results: MediaPipeResults) => void;
   private calibrationData: any = null;
 
-  // Velocity tracking
   private leftHistory: HistoryEntry[] = [];
   private rightHistory: HistoryEntry[] = [];
   private leftPrevVel = { x: 0, y: 0, z: 0 };
@@ -43,7 +45,7 @@ export class VisionEngine implements VisionEngineInterface {
 
   async initialize(): Promise<void> {
     if (this.isInitialized) return;
-    console.log('[VisionEngine] Loading MediaPipe...');
+    console.log('[VisionEngine] Loading MediaPipe for stable tracking...');
     
     try {
       const { HandLandmarker, PoseLandmarker, FilesetResolver } = await import('@mediapipe/tasks-vision');
@@ -52,7 +54,6 @@ export class VisionEngine implements VisionEngineInterface {
         'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
       );
 
-      // Try GPU first, fallback to CPU
       let delegate: 'GPU' | 'CPU' = 'GPU';
       try {
         this.handLandmarker = await HandLandmarker.createFromOptions(vision, {
@@ -62,12 +63,11 @@ export class VisionEngine implements VisionEngineInterface {
           },
           runningMode: 'VIDEO',
           numHands: 2,
-          minHandDetectionConfidence: 0.4,
-          minHandPresenceConfidence: 0.4,
-          minTrackingConfidence: 0.4
+          minHandDetectionConfidence: 0.45,
+          minHandPresenceConfidence: 0.45,
+          minTrackingConfidence: 0.45
         });
-      } catch (gpuErr) {
-        console.warn('[VisionEngine] GPU failed, trying CPU', gpuErr);
+      } catch {
         delegate = 'CPU';
         this.handLandmarker = await HandLandmarker.createFromOptions(vision, {
           baseOptions: {
@@ -76,9 +76,9 @@ export class VisionEngine implements VisionEngineInterface {
           },
           runningMode: 'VIDEO',
           numHands: 2,
-          minHandDetectionConfidence: 0.4,
-          minHandPresenceConfidence: 0.4,
-          minTrackingConfidence: 0.4
+          minHandDetectionConfidence: 0.45,
+          minHandPresenceConfidence: 0.45,
+          minTrackingConfidence: 0.45
         });
       }
 
@@ -90,18 +90,16 @@ export class VisionEngine implements VisionEngineInterface {
           },
           runningMode: 'VIDEO',
           numPoses: 1,
-          minPoseDetectionConfidence: 0.4,
-          minPosePresenceConfidence: 0.4,
-          minTrackingConfidence: 0.4
+          minPoseDetectionConfidence: 0.45,
+          minPosePresenceConfidence: 0.45,
+          minTrackingConfidence: 0.45
         });
-      } catch (e) {
-        console.warn('[VisionEngine] Pose landmarker failed', e);
-      }
+      } catch {}
 
       this.isInitialized = true;
-      console.log('[VisionEngine] Ready - delegate:', delegate);
+      console.log('[VisionEngine] Stable tracking ready -', delegate);
     } catch (e) {
-      console.warn('[VisionEngine] MediaPipe load failed, mock mode', e);
+      console.warn('[VisionEngine] Fallback', e);
       this.isInitialized = true;
       throw e;
     }
@@ -134,6 +132,8 @@ export class VisionEngine implements VisionEngineInterface {
     
     this.leftHistory = [];
     this.rightHistory = [];
+    this.leftStability.clear();
+    this.rightStability.clear();
     this.startDetectionLoop();
     
     return stream;
@@ -171,32 +171,12 @@ export class VisionEngine implements VisionEngineInterface {
         const processed = this.processResults(handResults, poseResults, now);
         this.lastResults = processed;
         this.onResultsCallback?.(processed);
-      } catch (e) {
-        // continue
-      }
+      } catch {}
 
       this.rafId = requestAnimationFrame(detect);
     };
 
     detect();
-  }
-
-  private calculateVelocity(history: HistoryEntry[], current: {x:number,y:number,z:number}, now: number) {
-    // Keep last 5 entries within 200ms
-    const recent = history.filter(h => now - h.t < 250);
-    if (recent.length < 2) {
-      return { x: 0, y: 0, z: 0 };
-    }
-    const oldest = recent[0];
-    const newest = recent[recent.length - 1];
-    const dt = (newest.t - oldest.t) / 1000; // seconds
-    if (dt < 0.01) return { x: 0, y: 0, z: 0 };
-    
-    return {
-      x: (newest.x - oldest.x) / dt,
-      y: (newest.y - oldest.y) / dt,
-      z: (newest.z - oldest.z) / dt,
-    };
   }
 
   private processResults(handResults: any, poseResults: any, timestamp: number): MediaPipeResults {
@@ -211,13 +191,12 @@ export class VisionEngine implements VisionEngineInterface {
     
     if (poseResults?.landmarks?.[0]) {
       const pose = poseResults.landmarks[0];
-      // 11:left shoulder, 12:right shoulder, 13:left elbow, 14:right elbow, 15:left wrist, 16:right wrist
-      if (pose[11]?.visibility > 0.3) leftShoulder = { x: pose[11].x, y: pose[11].y, z: pose[11].z ?? 0, visibility: pose[11].visibility };
-      if (pose[12]?.visibility > 0.3) rightShoulder = { x: pose[12].x, y: pose[12].y, z: pose[12].z ?? 0, visibility: pose[12].visibility };
-      if (pose[13]?.visibility > 0.3) leftElbow = { x: pose[13].x, y: pose[13].y, z: pose[13].z ?? 0, visibility: pose[13].visibility };
-      if (pose[14]?.visibility > 0.3) rightElbow = { x: pose[14].x, y: pose[14].y, z: pose[14].z ?? 0, visibility: pose[14].visibility };
-      if (pose[15]?.visibility > 0.3) poseLeftWrist = { x: pose[15].x, y: pose[15].y, z: pose[15].z ?? 0, visibility: pose[15].visibility };
-      if (pose[16]?.visibility > 0.3) poseRightWrist = { x: pose[16].x, y: pose[16].y, z: pose[16].z ?? 0, visibility: pose[16].visibility };
+      if (pose[11]?.visibility > 0.35) leftShoulder = { x: pose[11].x, y: pose[11].y, z: pose[11].z ?? 0, visibility: pose[11].visibility };
+      if (pose[12]?.visibility > 0.35) rightShoulder = { x: pose[12].x, y: pose[12].y, z: pose[12].z ?? 0, visibility: pose[12].visibility };
+      if (pose[13]?.visibility > 0.35) leftElbow = { x: pose[13].x, y: pose[13].y, z: pose[13].z ?? 0, visibility: pose[13].visibility };
+      if (pose[14]?.visibility > 0.35) rightElbow = { x: pose[14].x, y: pose[14].y, z: pose[14].z ?? 0, visibility: pose[14].visibility };
+      if (pose[15]?.visibility > 0.35) poseLeftWrist = { x: pose[15].x, y: pose[15].y, z: pose[15].z ?? 0, visibility: pose[15].visibility };
+      if (pose[16]?.visibility > 0.35) poseRightWrist = { x: pose[16].x, y: pose[16].y, z: pose[16].z ?? 0, visibility: pose[16].visibility };
 
       result.debug!.leftShoulder = leftShoulder;
       result.debug!.rightShoulder = rightShoulder;
@@ -225,7 +204,6 @@ export class VisionEngine implements VisionEngineInterface {
       result.debug!.rightWrist = poseRightWrist;
     }
 
-    // Process hands from HandLandmarker
     const detectedHands = new Map<string, any>();
 
     if (handResults?.landmarks) {
@@ -236,12 +214,14 @@ export class VisionEngine implements VisionEngineInterface {
         const key = isLeft ? 'left' : 'right';
         const wrist = landmarks[0];
         if (!wrist) continue;
-        detectedHands.set(key, { landmarks, wrist, confidence: handResults.handednesses?.[i]?.[0]?.score ?? 0.8, source: 'hand' });
+        const conf = handResults.handednesses?.[i]?.[0]?.score ?? 0.8;
+        if (conf < 0.4) continue; // stability: ignore low confidence
+        detectedHands.set(key, { landmarks, wrist, confidence: conf, source: 'hand' });
       }
     }
 
-    // Fallback to pose wrists if hand not detected (crucial for air punches)
-    if (!detectedHands.has('left') && poseLeftWrist) {
+    // Pose fallback - more stable for air punches
+    if (!detectedHands.has('left') && poseLeftWrist && (poseLeftWrist.visibility ?? 0) > 0.4) {
       detectedHands.set('left', { 
         landmarks: [], 
         wrist: poseLeftWrist, 
@@ -249,7 +229,7 @@ export class VisionEngine implements VisionEngineInterface {
         source: 'pose'
       });
     }
-    if (!detectedHands.has('right') && poseRightWrist) {
+    if (!detectedHands.has('right') && poseRightWrist && (poseRightWrist.visibility ?? 0) > 0.4) {
       detectedHands.set('right', { 
         landmarks: [], 
         wrist: poseRightWrist, 
@@ -258,19 +238,61 @@ export class VisionEngine implements VisionEngineInterface {
       });
     }
 
-    // Build tracking objects with velocity
     for (const [handKey, data] of detectedHands) {
       const isLeft = handKey === 'left';
       const wrist = data.wrist;
       
-      // Update history
-      const history = isLeft ? this.leftHistory : this.rightHistory;
-      history.push({ x: wrist.x, y: wrist.y, z: wrist.z ?? 0, t: timestamp });
-      if (history.length > 10) history.shift();
+      // Stability filtering
+      const stability = isLeft ? this.leftStability : this.rightStability;
+      const stable = stability.update(wrist, timestamp);
+      
+      // Ignore micro jitter < 8mm
+      if (stable.movement < 0.006 && stable.isStable) {
+        // Keep last velocity as 0 for stable guard position
+        const trackingStable: HandTracking = {
+          hand: handKey as any,
+          wrist: { x: stable.filteredPos.x, y: stable.filteredPos.y, z: stable.filteredPos.z },
+          elbow: isLeft ? leftElbow : rightElbow,
+          shoulder: isLeft ? leftShoulder : rightShoulder,
+          landmarks: data.landmarks?.map((l: any) => ({ x: l.x, y: l.y, z: l.z ?? 0, visibility: 1 })) || [],
+          velocity: { x: 0, y: 0, z: 0 },
+          acceleration: { x: 0, y: 0, z: 0 },
+          extension: this.calculateExtension(stable.filteredPos, isLeft ? leftShoulder : rightShoulder),
+          state: 'READY',
+          confidence: data.confidence * 0.9, // slightly reduce for stable
+        };
+        if (isLeft) result.leftHand = trackingStable;
+        else result.rightHand = trackingStable;
+        continue;
+      }
 
-      const velocity = this.calculateVelocity(history, wrist, timestamp);
+      // History for velocity
+      const history = isLeft ? this.leftHistory : this.rightHistory;
+      history.push({ x: stable.filteredPos.x, y: stable.filteredPos.y, z: stable.filteredPos.z, t: timestamp });
+      if (history.length > 12) history.shift();
+
+      // Calculate velocity with smoothing over 120ms window
+      let velocity = { x: 0, y: 0, z: 0 };
+      if (history.length >= 3) {
+        const windowMs = 120;
+        const recent = history.filter(h => timestamp - h.t <= windowMs);
+        if (recent.length >= 2) {
+          const first = recent[0];
+          const last = recent[recent.length - 1];
+          const dt = (last.t - first.t) / 1000;
+          if (dt > 0.02) {
+            velocity = {
+              x: (last.x - first.x) / dt,
+              y: (last.y - first.y) / dt,
+              z: (last.z - first.z) / dt,
+            };
+          }
+        }
+      }
+
+      // Acceleration
       const prevVel = isLeft ? this.leftPrevVel : this.rightPrevVel;
-      const dt = 0.033; // approx 30fps
+      const dt = 0.033;
       const acceleration = {
         x: (velocity.x - prevVel.x) / dt,
         y: (velocity.y - prevVel.y) / dt,
@@ -280,18 +302,18 @@ export class VisionEngine implements VisionEngineInterface {
       if (isLeft) this.leftPrevVel = velocity;
       else this.rightPrevVel = velocity;
 
-      // Smoothing
-      const filtered = isLeft ? this.leftFilter.filter(wrist, timestamp/1000) : this.rightFilter.filter(wrist, timestamp/1000);
+      // One Euro filter for final smoothing
+      const filtered = isLeft ? this.leftFilter.filter(stable.filteredPos, timestamp/1000) : this.rightFilter.filter(stable.filteredPos, timestamp/1000);
 
       const tracking: HandTracking = {
         hand: handKey as any,
-        wrist: { x: filtered.x, y: filtered.y, z: (filtered as any).z ?? wrist.z ?? 0 },
+        wrist: { x: filtered.x, y: filtered.y, z: (filtered as any).z ?? stable.filteredPos.z },
         elbow: isLeft ? leftElbow : rightElbow,
         shoulder: isLeft ? leftShoulder : rightShoulder,
         landmarks: data.landmarks?.map((l: any) => ({ x: l.x, y: l.y, z: l.z ?? 0, visibility: 1 })) || [],
         velocity,
         acceleration,
-        extension: this.calculateExtension(wrist, isLeft ? leftShoulder : rightShoulder),
+        extension: this.calculateExtension(stable.filteredPos, isLeft ? leftShoulder : rightShoulder),
         state: 'READY',
         confidence: data.confidence,
       };
@@ -311,7 +333,6 @@ export class VisionEngine implements VisionEngineInterface {
     const dy = wrist.y - shoulder.y;
     const dz = (wrist.z ?? 0) - (shoulder.z ?? 0);
     const dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
-    // Typical arm length 0.5-0.7 normalized
     return Math.min(1.2, dist / 0.55);
   }
 
@@ -345,6 +366,8 @@ export class VisionEngine implements VisionEngineInterface {
     }
     this.leftHistory = [];
     this.rightHistory = [];
+    this.leftStability.clear();
+    this.rightStability.clear();
   }
 
   setCalibration(data: any) {
