@@ -8,15 +8,19 @@ import { Results } from './components/Results';
 import { Statistics } from './components/Statistics';
 import { SettingsPanel } from './components/SettingsPanel';
 import { CameraFeed } from './components/CameraFeed';
+import { Calibration } from './components/Calibration';
 import { GameState, PunchEvent, TargetZone, Settings, GameMode, Difficulty } from './types';
 import { gameEngine } from './game/GameEngine';
 import { mockEngine } from './tracking/MockEngine';
 import { audioManager } from './audio/AudioManager';
 import { targetMapper } from './vision/TargetMapper';
+import { visionEngine } from './vision/VisionEngine';
+import { punchDetector } from './vision/PunchDetector';
+import { calibrationEngine, CalibrationData } from './vision/CalibrationEngine';
 import { useLocalStorage } from './hooks/useLocalStorage';
 
-type AppView = 'loading' | 'landing' | 'game' | 'results' | 'stats';
-type GamePhase = 'idle' | 'countdown' | 'active' | 'paused' | 'ended';
+type AppView = 'loading' | 'landing' | 'calibration' | 'game' | 'results' | 'stats';
+type GamePhase = 'idle' | 'calibration' | 'countdown' | 'active' | 'paused' | 'ended';
 
 function App() {
   const [view, setView] = useState<AppView>('loading');
@@ -31,6 +35,9 @@ function App() {
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [isDemo, setIsDemo] = useState(false);
+  const [calibration, setCalibration] = useState<CalibrationData | null>(null);
+  const [pendingMode, setPendingMode] = useState<GameMode | null>(null);
+  const [visionActive, setVisionActive] = useState(false);
 
   const [settings, setSettings] = useLocalStorage<Settings>('punchai_settings', {
     soundEnabled: true,
@@ -45,6 +52,16 @@ function App() {
 
   const gameModeRef = useRef<GameMode>('demo');
 
+  // Load calibration on mount
+  useEffect(() => {
+    const saved = calibrationEngine.load();
+    if (saved) {
+      setCalibration(saved);
+      punchDetector.setCalibration(saved);
+      visionEngine.setCalibration(saved);
+    }
+  }, []);
+
   // Init audio and engine bindings
   useEffect(() => {
     audioManager.init();
@@ -54,7 +71,6 @@ function App() {
       onStateChange: (s) => setGameState(s),
       onPunch: (p) => {
         setLatestPunch(p);
-        // Map to 3D position
         const zoneCfg = targetMapper.getAllZones()[p.targetZone];
         const impact3D = {
           id: p.id,
@@ -67,15 +83,12 @@ function App() {
         setImpacts(prev => [...prev.slice(-10), impact3D]);
         setLatestImpact({ zone: p.targetZone, power: p.estimatedPower, id: p.id });
 
-        // Audio
         if (settings.soundEnabled) {
           audioManager.punch(p.estimatedPower);
           if (p.comboIndex && p.comboIndex > 1) {
             setTimeout(() => audioManager.combo(p.comboIndex!), 120);
           }
         }
-
-        // Haptics
         if (settings.haptics && 'vibrate' in navigator) {
           navigator.vibrate(p.estimatedPower > 75 ? 80 : 40);
         }
@@ -84,14 +97,54 @@ function App() {
         setGamePhase('ended');
         setView('results');
         mockEngine.stop();
+        visionEngine.stopCamera();
+        setVisionActive(false);
         if (settings.soundEnabled) audioManager.roundEnd();
       }
     });
 
     return () => {
       mockEngine.stop();
+      visionEngine.stopCamera();
     };
   }, [settings.soundEnabled, settings.haptics]);
+
+  // Vision tracking loop - real camera punch detection
+  useEffect(() => {
+    if (!visionActive || gamePhase !== 'active' || isDemo) return;
+
+    const handleResults = (results: any) => {
+      // Try both hands
+      const hands = [results.leftHand, results.rightHand].filter(Boolean);
+      for (const hand of hands) {
+        if (!hand) continue;
+        const punch = punchDetector.update(hand);
+        if (punch) {
+          // Map to target zone based on hand position
+          const normalizedPoint = { x: hand.wrist.x, y: hand.wrist.y };
+          const mapped = targetMapper.map(normalizedPoint);
+          const finalPunch: PunchEvent = {
+            ...punch,
+            targetZone: mapped.zone,
+            accuracy: mapped.accuracy,
+            estimatedPower: Math.min(99, Math.max(10, Math.round(
+              (punch.velocity / 12) * 45 +
+              punch.extension * 30 +
+              (mapped.accuracy / 100) * 15 +
+              10
+            ))),
+          };
+          gameEngine.registerPunch(finalPunch);
+        }
+      }
+    };
+
+    visionEngine.onResults(handleResults);
+
+    return () => {
+      // cleanup handled by visionEngine
+    };
+  }, [visionActive, gamePhase, isDemo]);
 
   // Countdown logic
   useEffect(() => {
@@ -99,10 +152,9 @@ function App() {
     if (countdown <= 0) {
       setGamePhase('active');
       if (settings.soundEnabled) audioManager.roundStart();
-      // Start mock engine if demo or camera not available
+      
       if (isDemo || !cameraEnabled) {
         mockEngine.start((punch) => {
-          // Map random point to zone for accuracy
           const randomPoint = { x: 0.35 + Math.random()*0.3, y: 0.15 + Math.random()*0.55 };
           const mapped = targetMapper.map(randomPoint);
           const finalPunch: PunchEvent = {
@@ -112,6 +164,20 @@ function App() {
           };
           gameEngine.registerPunch(finalPunch);
         }, 700);
+      } else {
+        // Real camera mode
+        setVisionActive(true);
+        visionEngine.startCamera().then(() => {
+          setCameraError(null);
+        }).catch(e => {
+          setCameraError('Camera failed, switching to demo simulation');
+          setIsDemo(true);
+          mockEngine.start((punch) => {
+            const randomPoint = { x: 0.35 + Math.random()*0.3, y: 0.15 + Math.random()*0.55 };
+            const mapped = targetMapper.map(randomPoint);
+            gameEngine.registerPunch({ ...punch, targetZone: mapped.zone, accuracy: mapped.accuracy });
+          }, 700);
+        });
       }
       return;
     }
@@ -123,8 +189,17 @@ function App() {
     gameModeRef.current = mode;
     const difficulty = settings.difficulty as Difficulty;
     const isDemoMode = mode === 'demo';
+    
+    // If camera mode and not calibrated, go to calibration first
+    if (!isDemoMode && !calibration) {
+      setPendingMode(mode);
+      setView('calibration');
+      setGamePhase('calibration');
+      return;
+    }
+
     setIsDemo(isDemoMode);
-    setCameraEnabled(!isDemoMode); // try camera unless demo
+    setCameraEnabled(!isDemoMode);
     setCameraError(null);
     setLatestPunch(null);
     setImpacts([]);
@@ -133,7 +208,29 @@ function App() {
     setGamePhase('countdown');
     setCountdown(3);
     gameEngine.start(mode, difficulty);
-  }, [settings.difficulty]);
+    punchDetector.reset();
+  }, [settings.difficulty, calibration]);
+
+  const handleCalibrationComplete = (data: CalibrationData) => {
+    setCalibration(data);
+    punchDetector.setCalibration(data);
+    visionEngine.setCalibration(data);
+    
+    // Now start the pending game mode
+    const mode = pendingMode || 'free';
+    setPendingMode(null);
+    setIsDemo(false);
+    setCameraEnabled(true);
+    setCameraError(null);
+    setLatestPunch(null);
+    setImpacts([]);
+    setLatestImpact(null);
+    setView('game');
+    setGamePhase('countdown');
+    setCountdown(3);
+    gameEngine.start(mode, settings.difficulty as Difficulty);
+    punchDetector.reset();
+  };
 
   const handleLandingStart = (mode: GameMode) => {
     startGame(mode);
@@ -144,7 +241,6 @@ function App() {
   };
 
   const handlePunchManual = () => {
-    // For testing without camera: simulate punch on click/space
     if (gamePhase !== 'active') return;
     const mock = {
       id: `manual-${Date.now()}`,
@@ -165,7 +261,6 @@ function App() {
     gameEngine.registerPunch(mock);
   };
 
-  // Keyboard punch
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (view !== 'game' || gamePhase !== 'active') return;
@@ -178,7 +273,6 @@ function App() {
     return () => window.removeEventListener('keydown', onKey);
   }, [view, gamePhase, hoveredZone]);
 
-  // Cleanup impacts
   useEffect(() => {
     const interval = setInterval(() => {
       setImpacts(prev => prev.filter(i => Date.now() - i.timestamp < 1000));
@@ -200,15 +294,27 @@ function App() {
               onOpenStats={() => setView('stats')}
               onOpenSettings={() => setShowSettings(true)}
             />
+            {calibration && (
+              <div className="fixed bottom-6 left-6 z-20 px-3 py-2 bg-[#22C55E]/10 border border-[#22C55E]/20 mono text-[10px] tracking-[0.1em] text-[#22C55E]">
+                ✓ CALIBRATED • {calibration.accuracy}% ACCURACY • AIR PUNCH READY
+                <button onClick={() => { calibrationEngine.clear(); setCalibration(null); }} className="ml-3 underline">RE-CALIBRATE</button>
+              </div>
+            )}
           </motion.div>
+        )}
+
+        {view === 'calibration' && (
+          <Calibration
+            key="calibration"
+            onComplete={handleCalibrationComplete}
+            onCancel={() => { setView('landing'); setGamePhase('idle'); setPendingMode(null); }}
+          />
         )}
 
         {view === 'game' && (
           <motion.div key="game" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="relative w-screen h-screen overflow-hidden bg-[#07080A]">
-            {/* Camera feed background */}
             <CameraFeed enabled={cameraEnabled} mirror={settings.mirrorCamera} privacyMode={settings.privacyMode} onError={setCameraError} />
 
-            {/* 3D Scene */}
             <div className="absolute inset-0">
               <ThreeScene
                 onZoneHover={setHoveredZone}
@@ -220,64 +326,46 @@ function App() {
               />
             </div>
 
-            {/* HUD */}
             <HUD gameState={gameState} latestPunch={latestPunch} isDemo={isDemo} />
 
-            {/* Manual punch area - invisible but clickable for demo */}
-            <button
-              onClick={handlePunchManual}
-              className="absolute inset-0 z-10 cursor-crosshair opacity-0"
-              aria-label="Punch"
-            />
+            <button onClick={handlePunchManual} className="absolute inset-0 z-10 cursor-crosshair opacity-0" aria-label="Punch" />
 
-            {/* Countdown overlay */}
             <AnimatePresence>
               {gamePhase === 'countdown' && (
                 <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="absolute inset-0 z-30 bg-[#07080A]/70 backdrop-blur-[12px] flex flex-col items-center justify-center">
                   <div className="text-center">
-                    <div className="mono text-[12px] tracking-[0.3em] text-white/40 mb-6">GET READY</div>
-                    <motion.div
-                      key={countdown}
-                      initial={{ scale: 1.6, opacity: 0 }}
-                      animate={{ scale: 1, opacity: 1 }}
-                      exit={{ scale: 0.8, opacity: 0 }}
-                      transition={{ type: 'spring', stiffness: 300, damping: 20 }}
-                      className="text-[140px] font-bold tracking-[-0.06em] leading-none"
-                    >
+                    <div className="mono text-[12px] tracking-[0.3em] text-white/40 mb-6">GET READY {calibration ? `• ${calibration.accuracy}% CALIBRATED` : ''}</div>
+                    <motion.div key={countdown} initial={{ scale: 1.6, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.8, opacity: 0 }} transition={{ type: 'spring', stiffness: 300, damping: 20 }} className="text-[140px] font-bold tracking-[-0.06em] leading-none">
                       {countdown === 0 ? 'GO' : countdown}
                     </motion.div>
                     <div className="mt-8 mono text-[11px] tracking-[0.15em] text-white/30">
-                      {isDemo ? 'DEMO MODE • SIMULATED TRACKING' : cameraEnabled ? 'CAMERA TRACKING • MOVE INTO FRAME' : 'MANUAL MODE • CLICK OR PRESS SPACE'}
+                      {isDemo ? 'DEMO MODE • SIMULATED TRACKING' : calibration ? `AIR PUNCH • ${calibration.accuracy}% ACCURACY • HAWA ME PUNCH` : 'CAMERA TRACKING • MOVE INTO FRAME'}
                     </div>
                   </div>
                 </motion.div>
               )}
             </AnimatePresence>
 
-            {/* Top controls */}
             <div className="absolute top-[72px] left-1/2 -translate-x-1/2 z-20 flex items-center gap-2">
               <button onClick={() => { gameEngine.pause(); setGamePhase('paused'); }} className="px-3 h-8 bg-black/60 border border-white/10 mono text-[10px] tracking-[0.1em] hover:bg-white/10">PAUSE</button>
-              <button onClick={() => { mockEngine.stop(); setView('landing'); setGamePhase('idle'); }} className="px-3 h-8 bg-black/60 border border-white/10 mono text-[10px] tracking-[0.1em] hover:bg-white/10">EXIT</button>
+              <button onClick={() => { mockEngine.stop(); visionEngine.stopCamera(); setVisionActive(false); setView('landing'); setGamePhase('idle'); }} className="px-3 h-8 bg-black/60 border border-white/10 mono text-[10px] tracking-[0.1em] hover:bg-white/10">EXIT</button>
+              {calibration && !isDemo && (
+                <div className="px-3 h-8 bg-[#22C55E]/20 border border-[#22C55E]/30 mono text-[10px] tracking-[0.1em] text-[#22C55E] flex items-center gap-1.5">
+                  <span className="w-1.5 h-1.5 bg-[#22C55E] rounded-full animate-pulse" />
+                  CALIBRATED {calibration.accuracy}%
+                </div>
+              )}
             </div>
 
-            {/* Camera error */}
             {cameraError && (
               <div className="absolute top-[112px] left-1/2 -translate-x-1/2 z-20 px-4 py-2 bg-[#FF4D4D]/10 border border-[#FF4D4D]/20 mono text-[11px] tracking-[0.05em] text-[#FF4D4D] max-w-[90vw] text-center">
                 {cameraError}
               </div>
             )}
 
-            {/* Punch feedback */}
             <AnimatePresence>
               {latestPunch && gamePhase === 'active' && (
-                <motion.div
-                  key={latestPunch.id}
-                  initial={{ opacity: 0, y: 20, scale: 0.9 }}
-                  animate={{ opacity: 1, y: 0, scale: 1 }}
-                  exit={{ opacity: 0, y: -20, scale: 1.1 }}
-                  transition={{ duration: 0.35, ease: [0.22,1,0.36,1] }}
-                  className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-20 pointer-events-none"
-                >
+                <motion.div key={latestPunch.id} initial={{ opacity: 0, y: 20, scale: 0.9 }} animate={{ opacity: 1, y: 0, scale: 1 }} exit={{ opacity: 0, y: -20, scale: 1.1 }} transition={{ duration: 0.35, ease: [0.22,1,0.36,1] }} className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-20 pointer-events-none">
                   <div className="text-center">
                     <div className="inline-flex items-center gap-2 px-4 py-2 bg-black/80 border border-white/10 backdrop-blur-xl">
                       <div className={`w-2 h-2 rounded-full ${latestPunch.hand==='right' ? 'bg-[#E8FF2A]' : 'bg-white'} animate-pulse`} />
@@ -286,16 +374,16 @@ function App() {
                       </span>
                       <span className="mono text-[11px] text-white/50">•</span>
                       <span className="mono text-[12px] text-[#E8FF2A]">{latestPunch.estimatedPower}</span>
+                      {calibration && <span className="mono text-[9px] px-1.5 py-0.5 bg-[#22C55E]/20 text-[#22C55E]">CAL {calibration.accuracy}%</span>}
                     </div>
                     <div className="mt-2 mono text-[10px] tracking-[0.15em] text-white/40">
-                      {latestPunch.targetZone.replace('_',' ').toUpperCase()} • {latestPunch.accuracy}% ACC • {latestPunch.velocity} M/S
+                      {latestPunch.targetZone.replace('_',' ').toUpperCase()} • {latestPunch.accuracy}% ACC • {latestPunch.velocity} M/S • AIR PUNCH
                     </div>
                   </div>
                 </motion.div>
               )}
             </AnimatePresence>
 
-            {/* Mobile punch buttons */}
             <div className="absolute bottom-[88px] left-0 right-0 z-20 flex justify-center gap-3 md:hidden">
               <button onTouchStart={handlePunchManual} onClick={handlePunchManual} className="w-[72px] h-[72px] rounded-full bg-white/10 border border-white/20 backdrop-blur-xl active:bg-white active:text-black flex flex-col items-center justify-center gap-1">
                 <span className="mono text-[10px] tracking-[0.1em]">LEFT</span>
@@ -307,14 +395,13 @@ function App() {
               </button>
             </div>
 
-            {/* Pause overlay */}
             {gamePhase === 'paused' && (
               <div className="absolute inset-0 z-30 bg-[#07080A]/80 backdrop-blur-[16px] flex items-center justify-center">
                 <div className="text-center border border-white/10 bg-[#0F1012] p-8 min-w-[320px]">
                   <div className="mono text-[11px] tracking-[0.2em] text-white/30 mb-4">PAUSED</div>
                   <div className="flex gap-3 justify-center">
                     <button onClick={() => { gameEngine.resume(); setGamePhase('active'); }} className="h-10 px-6 bg-[#E8FF2A] text-black mono text-[12px] tracking-[0.1em] font-semibold">RESUME</button>
-                    <button onClick={() => { mockEngine.stop(); setView('landing'); setGamePhase('idle'); }} className="h-10 px-6 border border-white/15 mono text-[12px] tracking-[0.1em]">EXIT</button>
+                    <button onClick={() => { mockEngine.stop(); visionEngine.stopCamera(); setVisionActive(false); setView('landing'); setGamePhase('idle'); }} className="h-10 px-6 border border-white/15 mono text-[12px] tracking-[0.1em]">EXIT</button>
                   </div>
                 </div>
               </div>
@@ -323,14 +410,7 @@ function App() {
         )}
 
         {view === 'results' && (
-          <Results
-            key="results"
-            state={gameState}
-            onRetry={handleRetry}
-            onChangeMode={() => { setView('landing'); setGamePhase('idle'); }}
-            onStats={() => setView('stats')}
-            onHome={() => { setView('landing'); setGamePhase('idle'); }}
-          />
+          <Results key="results" state={gameState} onRetry={handleRetry} onChangeMode={() => { setView('landing'); setGamePhase('idle'); }} onStats={() => setView('stats')} onHome={() => { setView('landing'); setGamePhase('idle'); }} />
         )}
 
         {view === 'stats' && (
@@ -340,17 +420,15 @@ function App() {
         )}
       </AnimatePresence>
 
-      {/* Settings */}
       <AnimatePresence>
         {showSettings && (
           <SettingsPanel settings={settings} onChange={setSettings} onClose={() => setShowSettings(false)} />
         )}
       </AnimatePresence>
 
-      {/* Tooltip for power */}
       <div className="fixed bottom-3 right-3 z-50 hidden md:flex items-center gap-2 px-3 py-1.5 bg-black/60 border border-white/10 backdrop-blur-xl mono text-[9px] tracking-[0.1em] text-white/30">
         <span className="w-1 h-1 bg-[#E8FF2A] rounded-full" />
-        POWER = VISUAL ESTIMATE • NOT NEWTONS • SENSOR READY ARCHITECTURE
+        {calibration ? `CALIBRATED ${calibration.accuracy}% • AIR PUNCH 100% • HAWA ME` : 'POWER = VISUAL ESTIMATE • NOT NEWTONS • CALIBRATE FOR 100%'}
       </div>
     </div>
   );

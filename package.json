@@ -10,12 +10,13 @@
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0"
   },
   "dependencies": {
+    "@mediapipe/tasks-vision": "^1.0.1",
+    "@react-three/drei": "^9.92.7",
+    "@react-three/fiber": "^8.15.12",
+    "framer-motion": "^11.0.8",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "three": "^0.160.0",
-    "@react-three/fiber": "^8.15.12",
-    "@react-three/drei": "^9.92.7",
-    "framer-motion": "^11.0.8",
     "zustand": "^4.5.2"
   },
   "devDependencies": {

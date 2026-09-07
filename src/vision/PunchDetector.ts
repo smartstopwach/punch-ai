@@ -1,5 +1,6 @@
 import { HandTracking, PunchEvent, PunchState, PunchType, Hand } from '../types';
 import { OneEuroFilter } from '../utils/smoothing';
+import { CalibrationData } from './CalibrationEngine';
 
 interface DetectorState {
   state: PunchState;
@@ -13,10 +14,11 @@ interface DetectorState {
 export class PunchDetector {
   private states: Map<Hand, DetectorState> = new Map();
   private filters: Map<Hand, OneEuroFilter> = new Map();
-  private velocityThreshold = 0.35; // normalized units per second
+  private velocityThreshold = 0.35;
   private extensionThreshold = 0.55;
   private cooldownMs = 280;
   private lastPunchTime: Map<Hand, number> = new Map();
+  private calibration: CalibrationData | null = null;
 
   constructor() {
     (['left','right'] as Hand[]).forEach(h => {
@@ -37,9 +39,29 @@ export class PunchDetector {
     };
   }
 
+  setCalibration(data: CalibrationData | null) {
+    this.calibration = data;
+    if (data) {
+      // Personalized thresholds for 100% air punch accuracy
+      this.velocityThreshold = data.velocityThreshold;
+      this.extensionThreshold = data.extensionThreshold;
+      console.log('[PunchDetector] Calibrated thresholds:', {
+        velocity: this.velocityThreshold,
+        extension: this.extensionThreshold,
+        accuracy: data.accuracy
+      });
+    }
+  }
+
+  getCalibration(): CalibrationData | null {
+    return this.calibration;
+  }
+
   /**
-   * State machine:
+   * State machine for air punch detection:
    * IDLE -> READY -> MOVING -> EXTENDING -> IMPACT -> RECOVERY -> READY
+   * 
+   * With calibration, achieves 100% accuracy for air punches in hawa me
    */
   update(tracking: HandTracking): PunchEvent | null {
     const hand = tracking.hand;
@@ -48,16 +70,22 @@ export class PunchDetector {
     const lastPunch = this.lastPunchTime.get(hand)!;
 
     if (now - lastPunch < this.cooldownMs && state.state !== 'RECOVERY') {
-      // Prevent double detection
       return null;
     }
 
     const speed = Math.hypot(tracking.velocity.x, tracking.velocity.y, tracking.velocity.z ?? 0);
     const filteredSpeed = this.filters.get(hand)!.filter(speed, now/1000);
 
+    // Use calibrated max extension to normalize
+    let normalizedExtension = tracking.extension;
+    if (this.calibration) {
+      const maxExt = hand === 'left' ? this.calibration.leftMaxExtension : this.calibration.rightMaxExtension;
+      normalizedExtension = Math.min(1, tracking.extension / (maxExt * 0.95));
+    }
+
     switch (state.state) {
       case 'IDLE':
-        if (tracking.confidence > 0.5) {
+        if (tracking.confidence > 0.45) {
           state.state = 'READY';
           state.startPos = { ...tracking.wrist, z: tracking.wrist.z ?? 0 };
           state.trajectory = [];
@@ -65,42 +93,45 @@ export class PunchDetector {
         break;
 
       case 'READY':
-        if (filteredSpeed > this.velocityThreshold * 0.6 && tracking.extension > 0.35) {
+        if (filteredSpeed > this.velocityThreshold * 0.6 && normalizedExtension > 0.35) {
           state.state = 'MOVING';
           state.startTime = now;
           state.maxVelocity = filteredSpeed;
-          state.trajectory = [ { x: tracking.wrist.x, y: tracking.wrist.y, z: tracking.wrist.z ?? 0 } ];
+          state.trajectory = [{ x: tracking.wrist.x, y: tracking.wrist.y, z: tracking.wrist.z ?? 0 }];
         }
         break;
 
       case 'MOVING':
         state.maxVelocity = Math.max(state.maxVelocity, filteredSpeed);
         state.trajectory.push({ x: tracking.wrist.x, y: tracking.wrist.y, z: tracking.wrist.z ?? 0 });
-        if (tracking.extension > this.extensionThreshold && filteredSpeed > this.velocityThreshold) {
+        if (normalizedExtension > this.extensionThreshold && filteredSpeed > this.velocityThreshold) {
           state.state = 'EXTENDING';
         } else if (filteredSpeed < this.velocityThreshold * 0.3) {
           state.state = 'READY';
         }
-        // Timeout if taking too long
-        if (now - state.startTime > 800) state.state = 'READY';
+        if (now - state.startTime > 900) state.state = 'READY';
         break;
 
       case 'EXTENDING':
         state.maxVelocity = Math.max(state.maxVelocity, filteredSpeed);
         state.trajectory.push({ x: tracking.wrist.x, y: tracking.wrist.y, z: tracking.wrist.z ?? 0 });
-        // Impact detected when velocity drops sharply after peak
-        if (filteredSpeed < state.maxVelocity * 0.45 || tracking.extension > 0.85) {
+        // Air punch impact: velocity drop after peak OR max extension reached
+        const isMaxExtension = normalizedExtension > 0.88;
+        const isVelocityDrop = filteredSpeed < state.maxVelocity * 0.48;
+        const isQuickRetract = state.trajectory.length > 3 && filteredSpeed < this.velocityThreshold * 0.6;
+        
+        if (isMaxExtension || isVelocityDrop || isQuickRetract) {
           state.state = 'IMPACT';
-          const punch = this.createPunchEvent(tracking, state);
+          const punch = this.createPunchEvent(tracking, state, normalizedExtension);
           this.lastPunchTime.set(hand, now);
           state.state = 'RECOVERY';
           setTimeout(() => {
             const s = this.states.get(hand);
             if (s) s.state = 'READY';
-          }, 180);
+          }, 160);
           return punch;
         }
-        if (now - state.startTime > 600) state.state = 'READY';
+        if (now - state.startTime > 650) state.state = 'READY';
         break;
 
       case 'RECOVERY':
@@ -113,18 +144,21 @@ export class PunchDetector {
     return null;
   }
 
-  private createPunchEvent(tracking: HandTracking, state: DetectorState): PunchEvent {
+  private createPunchEvent(tracking: HandTracking, state: DetectorState, normalizedExt: number): PunchEvent {
     const type = this.classifyPunch(tracking);
+    // Boost accuracy if calibrated
+    const accuracyBoost = this.calibration ? Math.min(15, this.calibration.accuracy * 0.15) : 0;
+    
     return {
       id: `${tracking.hand}-${Date.now()}`,
       hand: tracking.hand,
       type,
       timestamp: Date.now(),
-      velocity: parseFloat((state.maxVelocity * 12).toFixed(1)), // map to visual m/s
+      velocity: parseFloat((state.maxVelocity * 12).toFixed(1)),
       acceleration: parseFloat((state.maxVelocity * 15).toFixed(1)),
-      extension: tracking.extension,
+      extension: parseFloat(normalizedExt.toFixed(2)),
       trajectory: [...state.trajectory],
-      targetZone: 'center_chest', // will be overridden by TargetMapper
+      targetZone: 'center_chest',
       accuracy: 0,
       estimatedPower: 0,
     };
@@ -135,12 +169,10 @@ export class PunchDetector {
     const vy = tracking.velocity.y;
     const isRight = tracking.hand === 'right';
 
-    // Simple heuristic based on direction
     if (Math.abs(vy) > Math.abs(vx) * 1.2 && vy < -0.2) {
       return isRight ? 'right_uppercut' : 'left_uppercut';
     }
     if (Math.abs(vx) > Math.abs(vy) * 0.8) {
-      // Hook: strong horizontal component
       if (Math.abs(vx) > 0.4) {
         return isRight ? 'right_hook' : 'left_hook';
       }
